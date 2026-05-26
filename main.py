@@ -43,9 +43,15 @@ class Robot:
         self._entry_pending_timeout = timedelta(seconds=30)
 
         # Tracked order IDs (for cancelling)
-        self._grid_order_id: str | None = None
-        self._tp_order_ids: list[str] = []  # Multiple TPs possible
+        # Fix #1: multiple grid orders, dict order_id -> level
+        self._grid_order_ids: dict[str, int] = {}  # order_id -> grid level
+        # Fix #2: TP orders, dict order_id -> level
+        self._tp_order_ids: dict[str, int] = {}  # order_id -> grid level
         self._poc_tp_order_id: str | None = None
+
+        # Fix #4: periodic broker sync
+        self._last_broker_sync: datetime = datetime.now(MSK) - timedelta(minutes=1)
+        self._broker_sync_interval = timedelta(minutes=1)
 
         # Skip ticks
         self._skip_ticks = 0
@@ -172,6 +178,25 @@ class Robot:
             self._last_price_log = datetime.now(MSK)
             log.info(f"Price: {q.last:.0f} | VP: VAL={self.strategy.val:.0f} VAH={self.strategy.vah:.0f} POC={self.strategy.poc:.0f}")
 
+        # Fix #3: entry fill timeout
+        if self._entry_pending and self._entry_pending_since:
+            elapsed = datetime.now(MSK) - self._entry_pending_since
+            if elapsed > self._entry_pending_timeout:
+                log.warning(f"Entry pending timeout ({elapsed.seconds}s) — resetting")
+                if self._grid_order_ids and self.orders:
+                    for oid in list(self._grid_order_ids.keys()):
+                        self.orders.cancel(oid)
+                self._entry_pending = False
+                self._entry_pending_since = None
+                self._skip_ticks = 30
+                return
+
+        # Fix #4: periodic broker sync
+        now = datetime.now(MSK)
+        if (now - self._last_broker_sync) >= self._broker_sync_interval:
+            self._last_broker_sync = now
+            self._sync_broker()
+
         if not self.strategy.has_position:
             # Check entry on quote
             if (self._mode == "running" and not self._entry_pending
@@ -290,25 +315,21 @@ class Robot:
         self._save_state()
 
     def _place_grid(self, sig):
-        """Place grid limit order."""
+        """Place grid limit order. Fix #1: don't cancel previous grids."""
         if self._paper:
             log.info(f"[PAPER] GRID-{sig.level} {'BUY' if sig.direction==BUY else 'SELL'} @ {sig.price:.0f}")
             return
         if not self.orders:
             return
-        # Cancel existing grid if any
-        if self._grid_order_id:
-            self.orders.cancel(self._grid_order_id)
-            self._grid_order_id = None
-
+        # Fix #1: don't cancel existing grids — each level is independent
         po = self.orders.place_limit(sig.direction, sig.quantity, sig.price, f"GRID-{sig.level}")
         if po:
-            self._grid_order_id = po.order_id
+            self._grid_order_ids[po.order_id] = sig.level
         else:
-            self._grid_order_id = None
+            log.warning(f"Grid-{sig.level} order failed")
 
     def _place_tp(self, sig):
-        """Place TP limit order."""
+        """Place TP limit order. Fix #2: track by dict."""
         if self._paper:
             log.info(f"[PAPER] TP-{sig.level} {'BUY' if sig.direction==BUY else 'SELL'} @ {sig.price:.0f}")
             return
@@ -317,7 +338,7 @@ class Robot:
 
         po = self.orders.place_limit(sig.direction, sig.quantity, sig.price, f"TP-{sig.level}")
         if po:
-            self._tp_order_ids.append(po.order_id)
+            self._tp_order_ids[po.order_id] = sig.level
         # Don't cancel other TPs — each grid level has its own TP
 
     def _place_poc_tp(self, sig):
@@ -410,7 +431,7 @@ class Robot:
     # === REAL FILL PROCESSING ===
 
     def _process_real_fill(self, evt: TradeEvent):
-        """Match fill to tracked orders (non-paper)."""
+        """Match fill to tracked orders (non-paper). Fix #2: use dicts."""
         oid = evt.order_id
 
         # Entry fill
@@ -421,11 +442,11 @@ class Robot:
             )
             return
 
-        # Grid fill
-        if oid == self._grid_order_id:
-            log.info(f"Grid fill @ {evt.price:.0f}")
+        # Grid fill (Fix #1/#2: check in dict)
+        if oid in self._grid_order_ids:
+            level = self._grid_order_ids.pop(oid)
+            log.info(f"Grid-{level} fill @ {evt.price:.0f}")
             signals = self.strategy.on_grid_fill(evt.price)
-            self._grid_order_id = None
             for sig in signals:
                 if sig.action == "GRID":
                     self._place_grid(sig)
@@ -434,11 +455,11 @@ class Robot:
             self._save_state()
             return
 
-        # TP fill
+        # TP fill (Fix #2: check in dict)
         if oid in self._tp_order_ids:
-            log.info(f"TP fill @ {evt.price:.0f}")
+            level = self._tp_order_ids.pop(oid)
+            log.info(f"TP-{level} fill @ {evt.price:.0f}")
             self.strategy.on_tp_fill(evt.price)
-            self._tp_order_ids.remove(oid)
             self._save_state()
             return
 
@@ -510,8 +531,8 @@ class Robot:
         """Cancel all tracked orders."""
         if not self.orders:
             return
-        if self._grid_order_id:
-            self.orders.cancel(self._grid_order_id)
+        for oid in self._grid_order_ids:
+            self.orders.cancel(oid)
         for oid in self._tp_order_ids:
             self.orders.cancel(oid)
         if self._poc_tp_order_id:
@@ -519,8 +540,8 @@ class Robot:
 
     def _reset_tracked(self):
         """Reset all tracked order IDs."""
-        self._grid_order_id = None
-        self._tp_order_ids = []
+        self._grid_order_ids = {}
+        self._tp_order_ids = {}
         self._poc_tp_order_id = None
 
     def _warmup_vp(self):

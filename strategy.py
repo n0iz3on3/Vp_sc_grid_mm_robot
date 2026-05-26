@@ -187,16 +187,28 @@ class Strategy:
         grid_sig = self._create_grid_signal(1)
         if grid_sig:
             signals.append(grid_sig)
-        # Place POC-TP for entry lot
+        # Place POC-TP for entry lot (Fix #5: sanity check)
         if self.poc > 0:
-            side = SELL if direction == 1 else BUY
-            signals.append(Signal(
-                action="PLACE_POC_TP",
-                direction=side,
-                price=self.poc,
-                quantity=1,  # entry lot only
-                tag="POC-TP",
-            ))
+            if direction == 1 and self.poc > price:
+                side = SELL
+                signals.append(Signal(
+                    action="PLACE_POC_TP",
+                    direction=side,
+                    price=self.poc,
+                    quantity=1,
+                    tag="POC-TP",
+                ))
+            elif direction == -1 and self.poc < price:
+                side = BUY
+                signals.append(Signal(
+                    action="PLACE_POC_TP",
+                    direction=side,
+                    price=self.poc,
+                    quantity=1,
+                    tag="POC-TP",
+                ))
+            else:
+                pass  # POC-TP would be at loss — skip
         return signals
 
     def on_grid_fill(self, grid_price: float) -> list[Signal]:
